@@ -131,12 +131,15 @@ parser.add_argument('--eval-interval-end', default=0.75, type=float)
 # Dataset parameters
 parser.add_argument('data_dir', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('--dataset', '-d', metavar='NAME', default='',
+
+parser.add_argument('--dataset', '-d', metavar='NAME', default='cifar100',
                     help='dataset type (default: ImageFolder/ImageTar if empty)')
+
 parser.add_argument('--train-split', metavar='NAME', default='train',
                     help='dataset train split (default: train)')
 parser.add_argument('--val-split', metavar='NAME', default='validation',
                     help='dataset validation split (default: validation)')
+
 parser.add_argument('--dataset-download', action='store_true', default=False,
                     help='Allow download of dataset for torch/ and tfds/ datasets that support it.')
 parser.add_argument('--class-map', default='', type=str, metavar='FILENAME',
@@ -365,10 +368,12 @@ def _parse_args():
     return args, args_text
 
 
-def main():
-    setup_default_logging(log_path='train.log')
-    args, args_text = _parse_args()
+def configure_environment(args):
+    """Configure distributed settings, device, seed and AMP selection.
 
+    Returns:
+        use_amp (str|None): 'apex' or 'native' if AMP is requested and available, else None
+    """
     args.prefetcher = (not args.no_prefetcher) and (args.distiller != 'crd')
     args.distributed = False
     if 'WORLD_SIZE' in os.environ:
@@ -412,9 +417,15 @@ def main():
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
 
     random_seed(args.seed, args.rank)
+    return use_amp
 
-    Distiller = get_distiller(args.distiller)
 
+def build_model_and_teacher(args, Distiller):
+    """Create student model and optional teacher model. Register custom forwards if required.
+
+    Returns:
+        model (torch.nn.Module), teacher (torch.nn.Module|None)
+    """
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -444,12 +455,21 @@ def main():
 
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
-        args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
+        args.num_classes = model.num_classes  # keep original behavior
 
     if args.rank == 0:
         _logger.info(
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
 
+    return model, teacher
+
+
+def prepare_datasets_and_model_transforms(args, model, Distiller):
+    """Resolve data config, possibly convert split-bn or sync-bn and create train/eval datasets.
+
+    Returns:
+        model (maybe converted), data_config, dataset_train, dataset_eval, num_aug_splits
+    """
     data_config = resolve_data_config(vars(args), model=model, verbose=args.rank == 0)
 
     # setup augmentation batch splits for contrastive loss or split bn
@@ -466,7 +486,7 @@ def main():
     # setup synchronized BatchNorm for distributed training
     if args.distributed and args.sync_bn:
         assert not args.split_bn
-        if has_apex and use_amp == 'apex':
+        if has_apex and args.apex_amp:
             # Apex SyncBN preferred unless native amp is activated
             model = convert_syncbn_model(model)
         else:
@@ -504,6 +524,24 @@ def main():
             class_map=args.class_map,
             download=args.dataset_download,
             batch_size=args.batch_size)
+
+    return model, data_config, dataset_train, dataset_eval, num_aug_splits
+
+
+def main():
+    setup_default_logging(log_path='train.log')
+    args, args_text = _parse_args()
+    # configure environment (distributed, device, AMP selection, seed)
+    use_amp = configure_environment(args)
+
+    Distiller = get_distiller(args.distiller)
+
+    # build student and optional teacher models
+    model, teacher = build_model_and_teacher(args, Distiller)
+
+    # resolve data config, possibly convert BN variants and create datasets
+    model, data_config, dataset_train, dataset_eval, num_aug_splits = \
+        prepare_datasets_and_model_transforms(args, model, Distiller)
 
     # setup loss function
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
